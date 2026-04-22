@@ -1,0 +1,162 @@
+globals:
+  - id: scale_tare_offset
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+  - id: scale_calibration
+    type: float
+    restore_value: true
+    initial_value: "1062.77"
+
+  - id: scale_stable_count
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: scale_last_value
+    type: float
+    restore_value: false
+    initial_value: "0.0"
+  - id: scale_last_uploaded
+    type: float
+    restore_value: false
+    initial_value: "0.0"
+  - id: scale_upload_armed
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: scale_cal_step
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: scale_cal_known_mass
+    type: int
+    restore_value: true
+    initial_value: "100"
+
+sensor:
+  - platform: hx711
+    id: scale_raw
+    name: "${friendly_name} Scale Raw"
+    entity_category: diagnostic
+    dout_pin: GPIO36
+    clk_pin: GPIO27
+    gain: 128
+    update_interval: 200ms
+    filters:
+      - quantile: {window_size: 10, send_every: 5, send_first_at: 5, quantile: 0.9}
+      - delta: 50
+    on_value:
+      then:
+        - sensor.template.publish:
+            id: scale_weight
+            state: !lambda |-
+              float cal = id(scale_calibration);
+              if (cal <= 0.0f) cal = 1062.77f;
+              return (x - id(scale_tare_offset)) / cal;
+    web_server:
+      sorting_group_id: sorting_group_scale
+      sorting_weight: 1
+
+  - platform: template
+    id: scale_weight
+    name: "${friendly_name} Scale Weight"
+    icon: "mdi:weight-gram"
+    unit_of_measurement: "g"
+    accuracy_decimals: 2
+    update_interval: never
+    filters:
+      - lambda: |-
+          if (x <= 0.1f) return 0.0f;
+          return x;
+    on_value:
+      then:
+        - lambda: |-
+            constexpr float STABLE_DELTA    = 1.0f;
+            constexpr int   STABLE_NEEDED   = 5;
+            constexpr float EMPTY_THRESHOLD = 5.0f;
+            constexpr float LOAD_THRESHOLD  = 20.0f;
+            constexpr float UPLOAD_DELTA    = 2.0f;
+
+            if (id(menu_page) == 10) return;
+            if (fabsf(x - id(scale_last_value)) > STABLE_DELTA) {
+              id(scale_last_value) = x;
+              id(scale_stable_count) = 0;
+              return;
+            }
+            id(scale_stable_count) += 1;
+            if (id(scale_stable_count) != STABLE_NEEDED) return;
+
+            if (x < EMPTY_THRESHOLD) {
+              id(scale_last_uploaded) = 0.0f;
+              return;
+            }
+            if (x < LOAD_THRESHOLD) return;
+            if (id(current_spool_id) <= 0) return;
+            if (fabsf(x - id(scale_last_uploaded)) < UPLOAD_DELTA) return;
+
+            id(scale_last_uploaded) = x;
+            id(scale_upload_armed) = true;
+            ESP_LOGI("scale", "Stable %.1fg detected, queueing upload for spool %d",
+                     x, id(current_spool_id));
+        - if:
+            condition:
+              lambda: "return id(scale_upload_armed);"
+            then:
+              - lambda: "id(scale_upload_armed) = false;"
+              - script.execute:
+                  id: upload_spool_measurement
+                  weight_g: !lambda "return id(scale_last_uploaded);"
+                  spool_id: !lambda "return id(current_spool_id);"
+    web_server:
+      sorting_group_id: sorting_group_scale
+      sorting_weight: 5
+
+script:
+  - id: upload_spool_measurement
+    mode: queued
+    parameters:
+      weight_g: float
+      spool_id: int
+    then:
+      - http_request.send:
+          method: PUT
+          url: !lambda |-
+            char buf[160];
+            snprintf(buf, sizeof(buf), "%s%d/measure",
+                     "${spoolman_url_spool_path}", spool_id);
+            return std::string(buf);
+          request_headers:
+            Content-Type: application/json
+          body: !lambda |-
+            char buf[64];
+            snprintf(buf, sizeof(buf), "{\"weight\":%.1f}", weight_g);
+            return std::string(buf);
+          capture_response: true
+          on_response:
+            - lambda: |-
+                if (response->status_code < 200 || response->status_code >= 300) {
+                  ESP_LOGW("scale", "Spoolman PUT /measure HTTP %d",
+                           response->status_code);
+                  return;
+                }
+                ESP_LOGI("scale", "Spoolman accepted measurement (HTTP %d)",
+                         response->status_code);
+                id(fetch_spool_by_id).execute();
+
+button:
+  - platform: template
+    name: "${friendly_name} Tare Scale"
+    icon: mdi:scale-balance
+    on_press:
+      then:
+        - lambda: |-
+            if (id(scale_raw).has_state()) {
+              id(scale_tare_offset) = id(scale_raw).state;
+              ESP_LOGI("scale", "Tare offset = %.0f raw counts", id(scale_tare_offset));
+            } else {
+              ESP_LOGW("scale", "Tare ignored: HX711 has no reading yet");
+            }
+    web_server:
+      sorting_group_id: sorting_group_scale
+      sorting_weight: 4

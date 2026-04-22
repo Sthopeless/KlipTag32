@@ -1,0 +1,505 @@
+globals:
+  - id: viewing_spool_id
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: viewing_filament_id
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: viewing_remaining_pct
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: menu_page
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: menu_index
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: menu_scroll
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: filament_filter_material
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: filament_cycle_direction
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: error_flash_until_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+script:
+  - id: cycle_viewing_filament
+    mode: restart
+    then:
+      - lambda: |-
+          const auto &opts = id(spool_select).traits.get_options();
+          if (opts.empty()) return;
+
+          auto parse_id = [](const std::string &opt) -> int {
+            size_t sep = opt.find(" | ");
+            return atoi((sep != std::string::npos ? opt.substr(0, sep) : opt).c_str());
+          };
+          auto parse_material = [](const std::string &opt) -> std::string {
+            size_t p1 = opt.find(" | ");
+            if (p1 == std::string::npos) return "";
+            size_t p2 = opt.find(" | ", p1 + 3);
+            if (p2 == std::string::npos) return "";
+            return opt.substr(p1 + 3, p2 - p1 - 3);
+          };
+
+          const std::string &flt = id(filament_filter_material);
+          std::vector<int> ids;
+          ids.reserve(opts.size());
+          for (const char *cstr : opts) {
+            std::string o = cstr;
+            if (flt.empty() || parse_material(o) == flt) {
+              int sid = parse_id(o);
+              if (sid > 0) ids.push_back(sid);
+            }
+          }
+          if (ids.empty()) {
+            ESP_LOGW("filament", "Cycle skipped: no spools match filter '%s'", flt.c_str());
+            return;
+          }
+
+          int cur = id(viewing_spool_id);
+          int pos = -1;
+          for (size_t i = 0; i < ids.size(); i++) {
+            if (ids[i] == cur) { pos = (int) i; break; }
+          }
+          int dir = id(filament_cycle_direction);
+          if (dir == 0) dir = 1;
+          int next_pos;
+          if (pos < 0) {
+            next_pos = (dir > 0) ? 0 : (int) ids.size() - 1;
+          } else {
+            next_pos = (pos + dir + (int) ids.size()) % (int) ids.size();
+          }
+          int next_id = ids[next_pos];
+          id(viewing_spool_id) = next_id;
+          id(viewing_filament_id) = 0;
+          id(viewing_filament_line_1).publish_state("");
+          id(viewing_filament_line_2).publish_state("loading...");
+          id(viewing_filament_line_3).publish_state("");
+          id(viewing_filament_line_4).publish_state("");
+          ESP_LOGI("filament", "Cycle %s -> spool %d (filter='%s', %d match)",
+                   dir > 0 ? "next" : "prev", next_id, flt.c_str(), (int) ids.size());
+      - script.execute: fetch_filament_info_for_view
+
+  - id: cycle_filament_filter
+    mode: restart
+    then:
+      - lambda: |-
+          const auto &opts = id(spool_select).traits.get_options();
+          std::vector<std::string> mats;
+          for (const char *cstr : opts) {
+            std::string o = cstr;
+            size_t p1 = o.find(" | ");
+            if (p1 == std::string::npos) continue;
+            size_t p2 = o.find(" | ", p1 + 3);
+            if (p2 == std::string::npos) continue;
+            std::string m = o.substr(p1 + 3, p2 - p1 - 3);
+            if (m.empty() || m == "?") continue;
+            bool found = false;
+            for (auto &x : mats) if (x == m) { found = true; break; }
+            if (!found) mats.push_back(m);
+          }
+
+          const std::string &cur = id(filament_filter_material);
+          std::string next;
+          if (cur.empty()) {
+            next = mats.empty() ? "" : mats[0];
+          } else {
+            int idx = -1;
+            for (size_t i = 0; i < mats.size(); i++) {
+              if (mats[i] == cur) { idx = (int) i; break; }
+            }
+            if (idx < 0 || idx + 1 >= (int) mats.size()) {
+              next = "";
+            } else {
+              next = mats[idx + 1];
+            }
+          }
+          id(filament_filter_material) = next;
+          id(menu_index) = 0;
+          id(menu_scroll) = 0;
+          ESP_LOGI("filament", "Filter -> '%s' (%d materials available)",
+                   next.c_str(), (int) mats.size());
+
+  - id: menu_move_up
+    mode: restart
+    then:
+      - lambda: |-
+          int page = id(menu_page);
+          if (page == 7) {
+            id(filament_cycle_direction) = -1;
+            id(cycle_viewing_filament).execute();
+            return;
+          }
+          if (page == 10 && id(scale_cal_step) == 1) {
+            int m = id(scale_cal_known_mass) - 1;
+            if (m < 1) m = 1;
+            id(scale_cal_known_mass) = m;
+            return;
+          }
+          id(menu_index) = id(menu_index) - 1;
+
+  - id: menu_move_down
+    mode: restart
+    then:
+      - lambda: |-
+          int page = id(menu_page);
+          if (page == 7) {
+            id(filament_cycle_direction) = 1;
+            id(cycle_viewing_filament).execute();
+            return;
+          }
+          if (page == 10 && id(scale_cal_step) == 1) {
+            id(scale_cal_known_mass) = id(scale_cal_known_mass) + 1;
+            return;
+          }
+          id(menu_index) = id(menu_index) + 1;
+
+  - id: menu_select
+    mode: restart
+    then:
+      - lambda: |-
+          int page = id(menu_page);
+          int idx = id(menu_index);
+
+          auto goto_page = [](int p) {
+            id(menu_page) = p;
+            id(menu_index) = 0;
+            id(menu_scroll) = 0;
+          };
+
+          auto parse_spool_id = [](const std::string &opt) -> int {
+            size_t sep = opt.find(" | ");
+            std::string id_part = (sep != std::string::npos) ? opt.substr(0, sep) : opt;
+            return atoi(id_part.c_str());
+          };
+
+          if (page == 0) {
+            switch (idx) {
+              case 0: {
+                goto_page(1);
+                const auto &opts = id(spool_select).traits.get_options();
+                for (size_t i = 0; i < opts.size(); i++) {
+                  if (parse_spool_id(opts[i]) == id(current_spool_id)) {
+                    id(menu_index) = (int) i;
+                    break;
+                  }
+                }
+                break;
+              }
+              case 1: goto_page(2); break;
+              case 2: {
+                goto_page(6);
+                const auto &opts = id(spool_select).traits.get_options();
+                for (size_t i = 0; i < opts.size(); i++) {
+                  if (parse_spool_id(opts[i]) == id(current_spool_id)) {
+                    id(menu_index) = (int) i;
+                    break;
+                  }
+                }
+                break;
+              }
+              case 3: goto_page(3); break;
+              case 4: goto_page(4); break;
+              case 5: goto_page(8); break;
+              case 6: goto_page(9); break;
+            }
+            return;
+          }
+
+          if (page == 1) {
+            const auto &opts = id(spool_select).traits.get_options();
+            if (idx < 0 || idx >= (int) opts.size()) return;
+            int sid = parse_spool_id(opts[idx]);
+            if (sid <= 0) return;
+            id(spool_select).publish_state(std::string(opts[idx]));
+            id(pending_spool_id) = sid;
+            id(change_active_spool).execute();
+            goto_page(0);
+            return;
+          }
+
+          if (page == 2) {
+            const auto &opts = id(spoolman_spools_select).traits.get_options();
+            if (idx < 0 || idx >= (int) opts.size()) return;
+            int sid = parse_spool_id(opts[idx]);
+            if (sid <= 0) return;
+            id(nfc_write_spool_id) = sid;
+            id(nfc_write_armed) = false;
+            id(nfc_write_status_text).publish_state("write_preparing");
+            id(prepare_nfc_write_from_selected_spool).execute();
+            goto_page(5);
+            return;
+          }
+
+          if (page == 3) {
+            goto_page(0);
+            return;
+          }
+
+          if (page == 4) {
+            switch (idx) {
+              case 0: id(refresh_backend_status).execute(); break;
+              case 1:
+                id(fetch_spools_list).execute();
+                id(fetch_spool_by_id).execute();
+                break;
+              case 2:
+                id(scale_cal_step) = 0;
+                goto_page(10);
+                return;
+              case 3: App.safe_reboot(); break;
+            }
+            goto_page(0);
+            return;
+          }
+
+          if (page == 5) {
+            id(nfc_write_armed) = false;
+            id(nfc_write_status_text).publish_state("write_cancelled");
+            goto_page(0);
+            return;
+          }
+
+          if (page == 6) {
+            const auto &all_opts = id(spool_select).traits.get_options();
+            const std::string &flt = id(filament_filter_material);
+            std::vector<std::string> opts;
+            opts.reserve(all_opts.size());
+            for (const char *cstr : all_opts) {
+              std::string o = cstr;
+              if (flt.empty()) { opts.push_back(std::move(o)); continue; }
+              size_t p1 = o.find(" | ");
+              if (p1 == std::string::npos) continue;
+              size_t p2 = o.find(" | ", p1 + 3);
+              if (p2 == std::string::npos) continue;
+              if (o.substr(p1 + 3, p2 - p1 - 3) == flt) opts.push_back(std::move(o));
+            }
+            if (idx < 0 || idx >= (int) opts.size()) return;
+            int sid = parse_spool_id(opts[idx]);
+            if (sid <= 0) return;
+            id(viewing_spool_id) = sid;
+            id(viewing_filament_id) = 0;
+            id(viewing_filament_line_1).publish_state("");
+            id(viewing_filament_line_2).publish_state("loading...");
+            id(viewing_filament_line_3).publish_state("");
+            id(viewing_filament_line_4).publish_state("");
+            id(fetch_filament_info_for_view).execute();
+            goto_page(7);
+            return;
+          }
+
+          if (page == 7) {
+            goto_page(6);
+            return;
+          }
+
+          if (page == 8) {
+            if (id(scale_raw).has_state()) {
+              id(scale_tare_offset) = id(scale_raw).state;
+              ESP_LOGI("scale", "Tare offset = %.0f raw counts (encoder)",
+                       id(scale_tare_offset));
+            } else {
+              ESP_LOGW("scale", "Tare ignored: HX711 has no reading yet");
+            }
+            return;
+          }
+
+          if (page == 9) {
+            goto_page(0);
+            return;
+          }
+
+          if (page == 10) {
+            int step = id(scale_cal_step);
+            if (step == 0) {
+              if (!id(scale_raw).has_state()) {
+                ESP_LOGW("scale", "Cal step 0 skipped: no raw reading yet");
+                return;
+              }
+              id(scale_tare_offset) = id(scale_raw).state;
+              ESP_LOGI("scale", "Cal tare = %.0f counts", id(scale_tare_offset));
+              id(scale_cal_step) = 1;
+              return;
+            }
+            if (step == 1) {
+              if (!id(scale_raw).has_state()) {
+                ESP_LOGW("scale", "Cal step 1 skipped: no raw reading yet");
+                return;
+              }
+              int mass = id(scale_cal_known_mass);
+              if (mass <= 0) {
+                ESP_LOGW("scale", "Cal step 1 skipped: mass must be > 0");
+                return;
+              }
+              float delta = id(scale_raw).state - id(scale_tare_offset);
+              if (delta <= 0.0f) {
+                ESP_LOGW("scale", "Cal step 1 skipped: delta %.0f <= 0", delta);
+                return;
+              }
+              float cal = delta / (float) mass;
+              id(scale_calibration) = cal;
+              ESP_LOGI("scale", "Cal done: %.2f counts/g (delta=%.0f, mass=%dg)",
+                       cal, delta, mass);
+              id(scale_cal_step) = 2;
+              return;
+            }
+            id(scale_last_value) = 0.0f;
+            id(scale_stable_count) = 0;
+            id(scale_last_uploaded) = 0.0f;
+            id(scale_upload_armed) = false;
+            goto_page(0);
+            return;
+          }
+
+binary_sensor:
+  - platform: gpio
+    id: menu_click
+    internal: true
+    pin:
+      number: GPIO25
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - script.execute: menu_select
+
+  - platform: gpio
+    id: menu_back
+    internal: true
+    pin:
+      number: GPIO26
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - lambda: |-
+            id(menu_page) = 0;
+            id(menu_index) = 0;
+            id(menu_scroll) = 0;
+
+  - platform: gpio
+    id: menu_home
+    internal: true
+    pin:
+      number: GPIO13
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: "return id(menu_page) == 6;"
+            then:
+              - script.execute: cycle_filament_filter
+            else:
+              - lambda: |-
+                  id(menu_page) = 0;
+                  id(menu_index) = 0;
+                  id(menu_scroll) = 0;
+
+sensor:
+  - platform: rotary_encoder
+    id: menu_encoder
+    internal: true
+    pin_a:
+      number: GPIO33
+      mode: INPUT_PULLUP
+    pin_b:
+      number: GPIO32
+      mode: INPUT_PULLUP
+    resolution: 1
+    on_clockwise:
+      then:
+        - script.execute: menu_move_down
+    on_anticlockwise:
+      then:
+        - script.execute: menu_move_up
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_sm
+    size: 10
+    glyphs: "!\"#%()*+,-./:;<=>?0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_abcdefghijklmnopqrstuvwxyz{|}~ "
+  - file: "gfonts://Roboto"
+    id: font_md
+    size: 14
+    glyphs: "!\"#%()*+,-./:;<=>?0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_abcdefghijklmnopqrstuvwxyz{|}~ "
+  - file: "gfonts://Roboto"
+    id: font_lg
+    size: 28
+    glyphs: "0123456789.-g "
+
+display:
+  - platform: ssd1306_i2c
+    model: "SH1106 128x64"
+    id: oled
+    address: 0x3C
+    update_interval: 250ms
+    lambda: 'kliptag32_ui::display_menu(it, "${project_version}");'
+
+text_sensor:
+  - platform: template
+    id: viewing_filament_line_1
+    name: "${friendly_name} Viewing Filament Line 1"
+    icon: mdi:numeric-1-box-multiple
+    update_interval: never
+    web_server:
+      sorting_group_id: sorting_group_filament_data
+      sorting_weight: 1
+
+  - platform: template
+    id: viewing_filament_line_2
+    name: "${friendly_name} Viewing Filament Line 2"
+    icon: mdi:numeric-2-box-multiple
+    update_interval: never
+    web_server:
+      sorting_group_id: sorting_group_filament_data
+      sorting_weight: 2
+
+  - platform: template
+    id: viewing_filament_line_3
+    name: "${friendly_name} Viewing Filament Line 4"
+    icon: mdi:numeric-4-box-multiple
+    update_interval: never
+    web_server:
+      sorting_group_id: sorting_group_filament_data
+      sorting_weight: 4
+
+  - platform: template
+    id: viewing_filament_line_4
+    name: "${friendly_name} Viewing Filament Line 5"
+    icon: mdi:numeric-5-box-multiple
+    update_interval: never
+    web_server:
+      sorting_group_id: sorting_group_filament_data
+      sorting_weight: 5
+
+  - platform: template
+    id: change_spool_error_text
+    name: "${friendly_name} Spool Change Error"
+    icon: mdi:alert-octagram
+    update_interval: never
+    web_server:
+      sorting_group_id: sorting_group_status
+      sorting_weight: 4

@@ -1,0 +1,187 @@
+globals:
+  - id: nfc_write_armed
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: nfc_write_started_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: nfc_write_payload
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: nfc_write_spool_id
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: spool_id_width
+    type: int
+    restore_value: false
+    initial_value: "2"
+  - id: nfc_cooldown_until_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: flash_until_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: flash_pending_from_nfc
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+rc522_spi:
+  id: rfid_reader
+  cs_pin: GPIO5
+  reset_pin: GPIO4
+  update_interval: 500ms
+  on_tag:
+    then:
+      - if:
+          condition:
+            lambda: "return millis() >= id(nfc_cooldown_until_ms);"
+          then:
+            - lambda: |-
+                ESP_LOGI("nfc", "Tag seen UID=%s", x.c_str());
+                if (id(nfc_write_armed)) {
+                  const bool ok = id(rfid_reader).write_ndef_text_ultralight(id(nfc_write_payload));
+                  if (ok) {
+                    id(nfc_write_armed) = false;
+                    id(nfc_write_status_text).publish_state("write_ok");
+                    id(nfc_cooldown_until_ms) = millis() + 10000;
+                    ESP_LOGI("nfc", "NFC write successful for UID=%s", x.c_str());
+                  } else {
+                    id(nfc_write_status_text).publish_state("write_failed_try_again");
+                    ESP_LOGW("nfc", "NFC write failed for UID=%s (still armed until timeout)", x.c_str());
+                  }
+                }
+            - homeassistant.tag_scanned: !lambda "return x;"
+  on_ndef_text:
+    then:
+      - if:
+          condition:
+            lambda: "return millis() >= id(nfc_cooldown_until_ms);"
+          then:
+            - lambda: |-
+                ESP_LOGI("nfc", "Tag NDEF text=%s", x.c_str());
+                int spool_id = 0;
+                int filament_id = 0;
+                size_t si = x.find("SPOOL:");
+                if (si != std::string::npos) {
+                  spool_id = atoi(x.substr(si + 6).c_str());
+                }
+                size_t fi = x.find("FILAMENT:");
+                if (fi != std::string::npos) {
+                  filament_id = atoi(x.substr(fi + 9).c_str());
+                }
+                if (filament_id > 0) {
+                  id(current_filament_id) = filament_id;
+                }
+                if (spool_id > 0) {
+                  id(flash_pending_from_nfc) = true;
+                  id(pending_spool_id) = spool_id;
+                  id(change_active_spool).execute();
+                  id(nfc_cooldown_until_ms) = millis() + 10000;
+                }
+
+script:
+  - id: prepare_nfc_write_from_selected_spool
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(nfc_write_spool_id) > 0;"
+          then:
+            - http_request.get:
+                url: !lambda |-
+                  return "${spoolman_url_spool_path}" + to_string(id(nfc_write_spool_id));
+                capture_response: true
+                on_response:
+                  - lambda: |-
+                      if (response->status_code != 200) {
+                        id(nfc_write_status_text).publish_state("write_prepare_http_error");
+                        ESP_LOGW("nfc", "Prepare NFC write spool HTTP %d", response->status_code);
+                        return;
+                      }
+                      bool parsed = json::parse_json(body, [](JsonObject root) -> bool {
+                        int sid = root["id"] | 0;
+                        int fid = root["filament"]["id"] | 0;
+                        if (sid <= 0 || fid <= 0) {
+                          return false;
+                        }
+                        id(nfc_write_payload) = "SPOOL:" + to_string(sid) + "\nFILAMENT:" + to_string(fid);
+                        id(nfc_write_started_ms) = millis();
+                        id(nfc_write_armed) = true;
+                        id(nfc_write_status_text).publish_state("armed_waiting_tag");
+                        ESP_LOGI("nfc", "NFC write armed for spool=%d filament=%d", sid, fid);
+                        return true;
+                      });
+                      if (!parsed) {
+                        id(nfc_write_status_text).publish_state("write_prepare_json_error");
+                        ESP_LOGW("nfc", "Prepare NFC write JSON parse failed");
+                      }
+          else:
+            - lambda: |-
+                id(nfc_write_status_text).publish_state("write_prepare_no_spool_selected");
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(nfc_write_armed) && (millis() - id(nfc_write_started_ms) > 20000)) {
+            id(nfc_write_armed) = false;
+            id(nfc_write_status_text).publish_state("write_timeout");
+            ESP_LOGW("nfc", "NFC write timeout waiting for tag");
+          }
+
+text_sensor:
+  - platform: template
+    id: nfc_write_status_text
+    name: "${friendly_name} NFC Write Status"
+    icon: mdi:nfc-variant
+    update_interval: never
+    web_server:
+      sorting_group_id: sorting_group_nfc_write
+      sorting_weight: 3
+
+select:
+  - platform: template
+    id: spoolman_spools_select
+    name: "${friendly_name} Spool Writer"
+    icon: mdi:nfc-variant
+    optimistic: true
+    options:
+      - "loading"
+    initial_option: "loading"
+    set_action:
+      - lambda: |-
+          ESP_LOGD("nfc", "Spool Writer staged: %s", x.c_str());
+    web_server:
+      sorting_group_id: sorting_group_nfc_write
+      sorting_weight: 1
+
+button:
+  - platform: template
+    name: "${friendly_name} Write NFC"
+    icon: mdi:nfc-tap
+    on_press:
+      then:
+        - lambda: |-
+            std::string selected = id(spoolman_spools_select).current_option().str();
+            size_t sep = selected.find(" | ");
+            std::string id_part = (sep != std::string::npos) ? selected.substr(0, sep) : selected;
+            int selected_id = atoi(id_part.c_str());
+            if (selected_id <= 0) {
+              id(nfc_write_status_text).publish_state("write_prepare_no_spool_selected");
+              ESP_LOGW("nfc", "Write NFC pressed without valid spool selection: %s", selected.c_str());
+              return;
+            }
+            id(nfc_write_spool_id) = selected_id;
+            id(nfc_write_armed) = false;
+            id(nfc_write_status_text).publish_state("write_preparing");
+        - script.execute: prepare_nfc_write_from_selected_spool
+    web_server:
+      sorting_group_id: sorting_group_nfc_write
+      sorting_weight: 2
