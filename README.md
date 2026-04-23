@@ -54,4 +54,4 @@ moonraker_ip: "IP:7125"
 kliptag32_area: ""
 ```
 
-- **Dependencies:** The project uses local components for the RC522 reader (`./components`). Ensure these files are placed correctly in your ESPHome filesystem.
+- **Dependencies:** The project uses local components for the RC522 reader (`./kliptag32/`). Ensure these files are placed correctly in your ESPHome filesystem.
