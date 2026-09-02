@@ -33,7 +33,7 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: ESPHome ${{ matrix.esphome-version }}
-        uses: esphome/build-action@f0a331817f5535854a10a42621b6a8b7ebe95c4c  # v7.2.0
+        uses: esphome/build-action@ae5408cdbc4f70692bf8e345c4982bca05a93667  # v8.1.0
         with:
           yaml-file: ${{ matrix.file }}.yaml
           version: ${{ matrix.esphome-version }}
